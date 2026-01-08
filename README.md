@@ -11,3 +11,6 @@ A folder `dump` will be created and the script dumps will be placed inside the f
 ## Load Modified Script
 Load modified script function is on by default.
 If a script file is found under `mod/<path of the script>`, the program will load it instead.
+
+## Redirect Lua print output to Console
+This function is off by default. To enable the function, open GOWR-Script-Loader.ini and change the value under console section from 0 to 1.
