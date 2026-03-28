@@ -16,6 +16,7 @@ bool DUMP_VISUAL_SCRIPT = false;
 bool LOAD_LUA = true;
 bool LOAD_VISUAL_SCRIPT = true;
 bool CONSOLE_LUA = false;
+bool CONSOLE_VISUAL_SCRIPT = false;
 QWORD baseAddress;
 QWORD hookRetAddress;
 std::set<std::string> nameSet;
@@ -54,6 +55,104 @@ Visual_Script_Load originalLoadVisualScriptFunctionAddr;
 typedef QWORD(__fastcall* Lua_Init)(QWORD L, QWORD preloadData);
 Lua_Init originalLuaInitFunctionAddr;
 
+typedef QWORD(__fastcall* VS_Evaluate)(QWORD state, QWORD* out, QWORD node, QWORD pNode);
+VS_Evaluate vsEvaluateFunctionAddr;
+
+typedef QWORD(__fastcall* VS_GetArrayLength)(QWORD arr);
+
+typedef QWORD(__fastcall* VS_GetNextElement)(QWORD arr, QWORD node, QWORD* out);
+
+std::string __fastcall vs_arrayToString(QWORD arr);
+
+std::string __fastcall vs_nodeToString(QWORD val[2]) {
+    std::string msg = "";
+    BYTE vType = *(BYTE*)(val[1] + 9);
+    if (vType == 0x1) {
+        char tmp = *(char*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "%X", tmp);
+        msg = msg + out;
+    }
+    else if (vType == 0x2) {
+        float tmp = *(float*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "%f", tmp);
+        msg = msg + out;
+    }
+    else if (vType == 0x3) {
+        DWORD tmp = *(DWORD*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "%d", tmp);
+        msg = msg + out;
+    }
+    else if (vType == 0x4) {
+        QWORD tmp = *(QWORD*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "%ld", tmp);
+        msg = msg + out;
+    }
+    else if (vType == 0xa) {
+        QWORD tmp = *(QWORD*)val[0];
+        if (tmp != 0) {
+            if (strlen((char*)tmp) > 200) {
+                char substring[201];
+                memcpy(substring, (void*)tmp, 200);
+                substring[200] = '\0';
+                msg = msg + (char*)tmp;
+            }
+            else {
+                msg = msg + (char*)tmp;
+            }
+        }
+        else {
+            msg = msg + "NULL";
+        }
+    }
+    else if (vType == 0xb) {
+        QWORD tmp = *(QWORD*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "(string hash)[%llX]", tmp);
+        msg = msg + out;
+    }
+    else if (vType == 0x10) {
+        return vs_arrayToString(*(QWORD*)val[0]);
+    }
+    else if (vType == 0x3e) {
+        QWORD tmp = *(QWORD*)val[0];
+        char out[100];
+        sprintf_s(out, 100, "(enum)[%llX]", tmp);
+        msg = msg + out;
+    }
+    else {
+        char out[100];
+        sprintf_s(out, 100, "Unsupported type: %X", vType);
+        spdlog::get("visualscript")->warn(out);
+    }
+    return msg;
+}
+std::string __fastcall vs_arrayToString(QWORD arr) {
+    std::string msg = "";
+    VS_GetArrayLength getLength = *(VS_GetArrayLength*)((*(QWORD*)arr) + 0x8);
+    VS_GetNextElement getNext = *(VS_GetNextElement*)((*(QWORD*)arr) + 0x10);
+    DWORD length = getLength(arr);
+    for (int i = 0; i < length; i++) {
+        QWORD val[2] = { 0,0 };
+        getNext(arr, i, &val[0]);
+        msg = msg + vs_nodeToString(val);
+    }
+    return msg;
+}
+QWORD __fastcall vs_print(QWORD unknown, QWORD node, QWORD state) {
+    QWORD e[2];
+    short paramId = *(short*)(node + 0x16);
+    if (paramId != 0xFFFF) {
+        vsEvaluateFunctionAddr(state, &e[0], node + 0x16, node);
+        std::string msg = vs_nodeToString(e);
+        spdlog::get("visualscript")->info(msg);
+    }
+    return (node+0x12);
+}
+
 int lua_print(QWORD L) {
     int n = lua_gettop(L);  /* number of arguments */
     int i;
@@ -80,8 +179,8 @@ int lua_print(QWORD L) {
 
 void __stdcall luaInit(QWORD Ls, QWORD preloadData) {
     originalLuaInitFunctionAddr(Ls, preloadData);
-    QWORD L = *(QWORD*)(Ls+0x58);
-    lua_pushcclosure(L,lua_print,0);
+    QWORD L = *(QWORD*)(Ls + 0x58);
+    lua_pushcclosure(L, lua_print, 0);
     lua_setglobal(L, "print");
 }
 
@@ -234,7 +333,37 @@ void hookLuaLoadfunction() {
     lua_tolstring = (Lua_Tolstring)(sigscan(
         L"GoWR.exe",
         "\x57\x48\x83\xec\x20\x49\x8b\xd8\x8b\xf2",
-        "xxxxxxxxxx"));
+        "xxxxxxxxxx")); 
+    if (CONSOLE_VISUAL_SCRIPT) {
+        vsEvaluateFunctionAddr = (VS_Evaluate)(sigscan(
+            L"GoWR.exe",
+            "\x48\x83\xec\x30\x4c\x8b\x61\x10",
+            "xxxxxxxx") - 0x18);
+
+        QWORD vs_print_addr = (QWORD)(sigscan(
+            L"GoWR.exe",
+            "\x48\xb9\x3e\xe0\x02\x02\xe4\xe1\xbe\x67\x48\x3b\xc1",
+            "xxxxxxxxxxxx"));
+        DWORD offset = *(DWORD*)(vs_print_addr + 0x15);
+        vs_print_addr = vs_print_addr + offset + 0x19 + 0x8;
+        offset = *(DWORD*)(vs_print_addr);
+        vs_print_addr = vs_print_addr + offset + 0x4;
+
+        uint8_t hookFunction[] =
+        {
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //mov rax, addr
+            0xFF, 0xE0 //jmp rax
+        };
+        uint64_t addrToJumpTo64 = (uint64_t)vs_print;
+
+        DWORD oldProtect;
+        VirtualProtect((void*)vs_print_addr, 1024, PAGE_EXECUTE_READWRITE, &oldProtect);
+        memcpy(&hookFunction[2], &addrToJumpTo64, sizeof(addrToJumpTo64));
+        memcpy((void*)vs_print_addr, hookFunction, sizeof(hookFunction));
+
+        VirtualProtect((void*)vs_print_addr, 1024, oldProtect, &oldProtect);
+    }
+
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(&(LPVOID&)originalLoadLuaFunctionAddr, (PBYTE)lua_loadR);
@@ -244,7 +373,6 @@ void hookLuaLoadfunction() {
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(&(LPVOID&)originalLoadVisualScriptFunctionAddr, (PBYTE)visual_script_loadR);
     DetourTransactionCommit();
-
     if (CONSOLE_LUA) {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -278,6 +406,9 @@ DWORD WINAPI loaderInit(LPVOID lpThreadParameter)
             if (ini["Console"].has("Lua")) {
                 CONSOLE_LUA = ini["Console"]["Lua"] == "1";
             }
+            if (ini["Console"].has("VisualScript")) {
+                CONSOLE_VISUAL_SCRIPT = ini["Console"]["VisualScript"] == "1";
+            }
         }
     }
     else {
@@ -286,10 +417,11 @@ DWORD WINAPI loaderInit(LPVOID lpThreadParameter)
         ini["Load"]["Lua"] = "1";
         ini["Load"]["VisualScript"] = "1";
         ini["Console"]["Lua"] = "0";
+        ini["Console"]["VisualScript"] = "0";
         file.generate(ini);
     }
 
-    if (CONSOLE_LUA && AllocConsole()) {
+    if ((CONSOLE_LUA || CONSOLE_VISUAL_SCRIPT) && AllocConsole()) {
         // Redirect standard I/O streams to the new console
         FILE* pCout;
         FILE* pCin;
@@ -302,7 +434,17 @@ DWORD WINAPI loaderInit(LPVOID lpThreadParameter)
         std::cout.clear();
         std::cin.clear();
         std::cerr.clear();
-        auto console = spdlog::stdout_color_mt("lua");
+        auto shared_console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        if (CONSOLE_LUA) {
+            std::vector<spdlog::sink_ptr> sinks1{ shared_console_sink };
+            auto logger1 = std::make_shared<spdlog::logger>("lua", begin(sinks1), end(sinks1));
+            spdlog::register_logger(logger1);
+        }
+        if (CONSOLE_VISUAL_SCRIPT) {
+            std::vector<spdlog::sink_ptr> sinks2{ shared_console_sink };
+            auto logger2 = std::make_shared<spdlog::logger>("visualscript", begin(sinks2), end(sinks2));
+            spdlog::register_logger(logger2);
+        }
     }
     else {
         CONSOLE_LUA = false;
